@@ -1,0 +1,18 @@
+seed: 7
+
+model:
+  id: meta-llama/Llama-3.2-3B-Instruct
+
+data:
+  synthetic:
+    relation: key_value_mapping_qa
+    num_pairs: 5
+    key_prefix: key
+    value_prefix: value
+
+metrics:
+  schema_version: 1
+
+runtime:
+  output_root: outputs
+

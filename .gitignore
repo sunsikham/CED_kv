@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+outputs/
+wandb/
+logs/
+checkpoints/
+artifacts/
+
+.DS_Store
+
