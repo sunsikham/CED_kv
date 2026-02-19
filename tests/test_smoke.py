@@ -62,6 +62,7 @@ class SmokeTest(unittest.TestCase):
             lines = [json.loads(line) for line in f if line.strip()]
         self.assertGreaterEqual(len(lines), 1)
         required_fields = {
+            "record_type",
             "run_id",
             "step",
             "split",
@@ -78,6 +79,7 @@ class SmokeTest(unittest.TestCase):
         for record in lines:
             self.assertTrue(required_fields.issubset(record))
             self.assertTrue(record["episode_id"])
+        self.assertTrue((run_dir / "report.json").exists())
 
 
 if __name__ == "__main__":

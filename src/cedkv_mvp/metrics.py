@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 REQUIRED_METRIC_FIELDS = (
+    "record_type",
     "run_id",
     "step",
     "split",
@@ -32,4 +33,3 @@ class MetricsWriter:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=True))
             f.write("\n")
-

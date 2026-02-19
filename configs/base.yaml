@@ -8,7 +8,7 @@ data:
     relation: key_value_mapping_qa
     num_pairs: 5
     key_prefix: key
-    value_prefix: value
+    value_prefix: V
 
 metrics:
   schema_version: 1
@@ -16,3 +16,62 @@ metrics:
 runtime:
   output_root: outputs
 
+phase0:
+  stub_mode: "null"
+  threshold_profile: phase0_stub
+  seed: 7
+  on_eval:
+    metric: exact_match
+    answer_format: single_token
+    num_samples: 64
+  off_eval:
+    delta_metric: kl_union_other
+    num_samples: 256
+  thresholds:
+    off_delta_p99_max: 0.05
+  reporting:
+    topk_tokens: 8
+
+phase1:
+  seed: 7
+  gate_mode: two_tier
+  layer_scope_gatea: all
+  layer_scope_gateb: top25
+  prefix_len: 32
+  model:
+    id: Qwen/Qwen2.5-1.5B-Instruct
+  runtime:
+    backend: mock
+    device: auto
+    allow_mock_fallback: false
+    torch_dtype: auto
+  eval:
+    on_samples: 64
+    off_samples: 256
+    repro_runs: 2
+    decoding: greedy
+  select:
+    mode: attention_diversity_span
+    span_len: 4
+    span_budget: 4
+    min_span_distance: 1
+  thresholds:
+    teacher_min_divergence: 0.02
+    alpha_roundtrip: 0.5
+    eps_null_floor: 0.001
+    eps_null_multiplier: 10.0
+    eps_nonzero_multiplier: 10.0
+    eps_teacher_cache_floor: 0.001
+    eps_teacher_cache_multiplier: 10.0
+    on_gain_advisory: 0.02
+    off_delta_p99_advisory: 0.05
+  reporting:
+    topk_tokens: 16
+  mock:
+    base_answer_prob: 0.08
+    teacher_answer_prob: 0.92
+    student_full_answer_prob: 0.86
+    student_selected_answer_prob: 0.55
+    student_random_answer_prob: 0.18
+    student_off_shift_prob: 0.10
+    student_off_selected_shift_prob: 0.02
