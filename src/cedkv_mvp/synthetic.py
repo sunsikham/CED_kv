@@ -16,13 +16,13 @@ def generate_synthetic_episode(config: dict[str, Any], rng: random.Random) -> di
     }
     keys = list(mapping.keys())
     query_key = rng.choice(keys)
-    answer = mapping[query_key]
+    answer = str(mapping[query_key]).strip()
     context = "\n".join(f"{k} -> {v}" for k, v in mapping.items())
     prompt = (
         "You are given key-value pairs.\n"
         f"{context}\n\n"
         f"Question: What is the value for {query_key}?\n"
-        "Answer:"
+        "Answer: "
     )
 
     return {
@@ -46,7 +46,7 @@ def generate_phase0_on_samples(
     samples: list[dict[str, str]] = []
     for _ in range(num_samples):
         episode = generate_synthetic_episode(config=config, rng=rng)
-        answer = str(episode["answer"])
+        answer = str(episode["answer"]).strip()
         if not _is_single_symbol(answer):
             raise ValueError(f"Phase0 ON answer must be a single symbol, got: {answer!r}")
 
@@ -97,7 +97,7 @@ def generate_phase1_on_samples(
     samples: list[dict[str, Any]] = []
     for _ in range(num_samples):
         episode = generate_synthetic_episode(config=config, rng=rng)
-        answer = str(episode["answer"])
+        answer = str(episode["answer"]).strip()
         if not _is_single_symbol(answer):
             raise ValueError(f"Phase1 ON answer must be a single symbol, got: {answer!r}")
 
@@ -105,7 +105,7 @@ def generate_phase1_on_samples(
         demo_lines = [f"{k} -> {v}" for k, v in mapping.items()]
         demo_text = "\n".join(demo_lines)
         question = f"What is the value for {episode['query_key']}?"
-        query_text = f"Question: {question}\nAnswer:"
+        query_text = f"Question: {question}\nAnswer: "
         full_teacher_text = f"Demo:\n{demo_text}\n\n{query_text}"
         samples.append(
             {

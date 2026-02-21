@@ -185,6 +185,32 @@ def answer_first_token_id(runtime: HFModelRuntime, answer_text: str) -> int | No
     return int(token_ids[0])
 
 
+def answer_first_token_candidate_ids(
+    runtime: HFModelRuntime,
+    answer_text: str,
+) -> list[int]:
+    answer = str(answer_text).strip()
+    if not answer:
+        return []
+    variants = [
+        answer,
+        f" {answer}",
+        f"\n{answer}",
+    ]
+    ordered: list[int] = []
+    for text in variants:
+        token_ids = runtime.tokenizer(
+            text,
+            add_special_tokens=False,
+        )["input_ids"]
+        if not token_ids:
+            continue
+        first = int(token_ids[0])
+        if first not in ordered:
+            ordered.append(first)
+    return ordered
+
+
 def kl_from_logits(
     student_logits: Any,
     base_logits: Any,
