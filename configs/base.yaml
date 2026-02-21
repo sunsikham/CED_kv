@@ -75,3 +75,152 @@ phase1:
     student_random_answer_prob: 0.18
     student_off_shift_prob: 0.10
     student_off_selected_shift_prob: 0.02
+
+phase2:
+  seed: 7
+  prefix_len: 32
+  model:
+    id: Qwen/Qwen2.5-1.5B-Instruct
+  runtime:
+    backend: hf
+    device: auto
+    allow_mock_fallback: false
+    torch_dtype: auto
+  eval:
+    on_samples: 64
+    off_samples: 256
+    repro_runs: 2
+    n_random_trials: 5
+    decoding: greedy
+  injection:
+    positioning_mode: compact
+  prefix:
+    padding_mode: null_pad
+  layer_scope:
+    selection: top25
+    injection: all
+  select:
+    mode: attention_diversity_span
+    span_len: 4
+    span_budget: 4
+    min_span_distance: 1
+    candidate_policy: input_and_delimiter_only
+    center_policy: start
+  thresholds:
+    teacher_min_divergence: 0.02
+    alpha_roundtrip: 0.5
+    eps_null_floor: 0.001
+    eps_null_multiplier: 10.0
+    eps_nonzero_multiplier: 10.0
+    eps_teacher_cache_floor: 0.001
+    eps_teacher_cache_multiplier: 10.0
+    on_gain_min: 0.02
+    off_delta_p99_max: 0.05
+    delta_on_min: 0.01
+    teacher_min_on_acc: 0.2
+    rel_kl_to_teacher_max: 1.0
+    repro_acc_tol: 0.02
+  reporting:
+    topk_tokens: 16
+
+phase3:
+  seed: 7
+  prefix_len: 32
+  run_index: 1
+  model:
+    id: Qwen/Qwen2.5-1.5B-Instruct
+  runtime:
+    backend: hf
+    device: auto
+    allow_mock_fallback: false
+    torch_dtype: auto
+  eval:
+    on_samples: 64
+    off_samples: 256
+    repro_runs: 2
+    decoding: greedy
+    off_fixed_stress:
+      size: 2048
+      seed: 3407
+      sampling: once_per_experiment
+      definition: phase2_stress_compatible
+  layer_scope:
+    mixture: top25
+    injection: top25
+  mix:
+    mode: v_only
+    k_anchor:
+      policy: warm_start_fixed
+  candidate:
+    atom_types:
+      - entry
+      - key_only
+      - value_only
+      - delimiter_only
+    delimiter:
+      mass_cap: 0.15
+      mass_penalty: 0.05
+      apply_stage: post_topk_renorm_per_slot
+  warm_start:
+    anti_steer_prior: proxy_prefix_mass
+    anti_steer_strength: 0.2
+  train:
+    steps: 80
+    lr: 0.05
+    grad_clip: 1.0
+    slot_count: 4
+    topk_schedule:
+      - 32
+      - 16
+      - 8
+      - 4
+    topk_milestones:
+      - 0.0
+      - 0.25
+      - 0.6
+      - 0.85
+    lambda_off:
+      adaptive: true
+      dual:
+        metric_source: fixed_stress_eval
+        lr: 0.05
+        ema_beta: 0.9
+        update_every: 5
+        lambda_min: 0.0
+        lambda_max: 10.0
+        delta_clip: 0.1
+  loss:
+    lambda_on: 1.0
+    lambda_off: 2.0
+    lambda_str: 0.1
+    off:
+      type: cvar
+      cvar_tail_fraction: 0.2
+      train_source: hard_pool
+      constraint_source: fixed_stress_eval
+      hard_pool_size: 64
+  thresholds:
+    teacher_min_divergence: 0.02
+    alpha_roundtrip: 0.5
+    eps_null_floor: 0.001
+    eps_null_multiplier: 10.0
+    eps_nonzero_multiplier: 10.0
+    eps_teacher_cache_floor: 0.001
+    eps_teacher_cache_multiplier: 10.0
+    on_gain_min: 0.02
+    off_delta_p99_max: 0.05
+    delta_on_min: 0.01
+    teacher_min_on_acc: 0.2
+    rel_kl_to_teacher_max: 1.0
+  milestone:
+    explore:
+      enabled: true
+      flag: phase3_explore
+      max_runs: 5
+      on_gain_drop_max: 0.01
+      off_tail_improve_min: 0.2
+      phase2_baseline_on_gain: 0.02
+      phase2_baseline_off_p99: 11.0
+  reporting:
+    topk_tokens: 16
+    atom_type_mass: true

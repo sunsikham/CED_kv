@@ -19,3 +19,9 @@ python3 -m cedkv_mvp --config configs/base.yaml --phase 1
 ```bash
 python3 -m cedkv_mvp --config configs/base.yaml --phase 1 --phase1-backend hf --phase1-strict-hf
 ```
+
+## Phase 3 quick start (HF strict)
+
+```bash
+python3 -m cedkv_mvp --config configs/base.yaml --phase 3 --phase3-strict-hf
+```
