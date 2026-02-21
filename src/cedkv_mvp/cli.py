@@ -9,7 +9,6 @@ from typing import Any
 from .config import load_config, write_yaml
 from .eval_phase0 import resolve_phase0_settings, run_phase0
 from .eval_phase1 import resolve_phase1_settings, run_phase1
-from .eval_phase2 import resolve_phase2_settings, run_phase2
 from .eval_phase3 import resolve_phase3_settings, run_phase3
 from .metrics import MetricsWriter
 from .report import write_report
@@ -381,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         model_id = settings.model_id
     elif args.phase == 2:
+        from .eval_phase2 import resolve_phase2_settings, run_phase2
+
         seed = int(config.get("phase2", {}).get("seed", config.get("seed", 0)))
         settings = resolve_phase2_settings(
             config=config,
