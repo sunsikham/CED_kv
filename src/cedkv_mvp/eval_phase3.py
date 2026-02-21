@@ -373,7 +373,13 @@ def run_phase3(
     )
 
     hard_pool = sorted(off_train_eval["stress_deltas"], reverse=True)[: settings.off_hard_pool_size]
-    loss_off = cvar_tail_mean(hard_pool, settings.cvar_tail_fraction)
+    hard_pool_loss_off = cvar_tail_mean(hard_pool, settings.cvar_tail_fraction)
+    fixed_stress_loss_off = cvar_tail_mean(off_fixed_eval["stress_deltas"], settings.cvar_tail_fraction)
+    loss_off = select_report_off_loss(
+        train_source=settings.off_train_source,
+        hard_pool_loss=hard_pool_loss_off,
+        fixed_stress_loss=fixed_stress_loss_off,
+    )
     loss_on = on_eval["on_kl_mean"]
     loss_str = _structural_loss(state_pool=state_pool, settings=settings)
 
@@ -412,6 +418,8 @@ def run_phase3(
         ("phase3_off_delta_mean_typical", off_fixed_eval["off_delta_mean_typical"]),
         ("phase3_loss_on", loss_on),
         ("phase3_loss_off", loss_off),
+        ("phase3_loss_off_hard_pool_eval", hard_pool_loss_off),
+        ("phase3_loss_off_fixed_stress_eval", fixed_stress_loss_off),
         ("phase3_loss_str", loss_str),
         ("phase3_lambda_off_last", float(lambda_trace[-1]["lambda_off"]) if lambda_trace else settings.lambda_off),
         ("phase3_gateA_pass", 1.0 if gatea["pass"] else 0.0),
@@ -511,6 +519,14 @@ def select_constraint_p99(metric_source: str, fixed_p99: float, hard_pool_p99: f
     if metric_source == "hard_pool":
         return float(hard_pool_p99)
     raise ValueError(f"Unsupported metric source: {metric_source}")
+
+
+def select_report_off_loss(train_source: str, hard_pool_loss: float, fixed_stress_loss: float) -> float:
+    if train_source == "hard_pool":
+        return float(hard_pool_loss)
+    if train_source == "fixed_stress_eval":
+        return float(fixed_stress_loss)
+    raise ValueError(f"Unsupported off_train_source: {train_source}")
 
 
 def _off_prompt_factors_tensor(
