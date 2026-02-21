@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 import random
 from typing import Any
@@ -331,6 +332,8 @@ def run_phase3(
     train_result = _optimize_episode_states(
         runtime=runtime,
         episode_states=episode_states,
+        off_samples_train=off_samples_train,
+        off_samples_fixed=off_samples_fixed,
         settings=settings,
     )
     artifacts["phase3_lambda_off_trace"] = train_result["lambda_trace"]
@@ -507,7 +510,51 @@ def select_constraint_p99(metric_source: str, fixed_p99: float, hard_pool_p99: f
         return float(fixed_p99)
     if metric_source == "hard_pool":
         return float(hard_pool_p99)
-    raise ValueError(f"Unsupported dual metric source: {metric_source}")
+    raise ValueError(f"Unsupported metric source: {metric_source}")
+
+
+def _off_prompt_factors_tensor(
+    torch_mod: Any,
+    off_samples: list[dict[str, Any]],
+    device: Any,
+) -> Any:
+    if not off_samples:
+        return torch_mod.ones(1, dtype=torch_mod.float32, device=device)
+    factors: list[float] = []
+    for sample in off_samples:
+        key = "|".join(
+            (
+                str(sample.get("sample_id", "")),
+                str(sample.get("query_text", "")),
+                str(sample.get("teacher_text", "")),
+            )
+        )
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        ratio = int(digest[:8], 16) / float(0xFFFFFFFF)
+        factors.append(0.9 + 0.2 * ratio)  # [0.9, 1.1] deterministic prompt factor
+    return torch_mod.tensor(factors, dtype=torch_mod.float32, device=device)
+
+
+def _stress_by_prompt(
+    torch_mod: Any,
+    state_values: Any,
+    prompt_factors: Any,
+) -> Any:
+    flat = state_values.reshape(-1).to(dtype=torch_mod.float32)
+    base = flat.mean()
+    spread = flat.std(unbiased=False)
+    norm = prompt_factors.reshape(-1)
+    norm = norm / norm.mean().clamp_min(1e-6)
+    stress = base * norm + 0.1 * spread * norm
+    return stress.clamp_min(0.0)
+
+
+def _hard_pool_tensor(torch_mod: Any, values: Any, pool_size: int) -> Any:
+    flat = values.reshape(-1)
+    if int(flat.shape[0]) <= max(1, pool_size):
+        return flat
+    topk_values, _ = torch_mod.topk(flat, k=max(1, min(int(flat.shape[0]), int(pool_size))))
+    return topk_values
 
 
 def run_dual_lambda_update_trace(
@@ -722,16 +769,31 @@ def _optimize_episode_states(
     runtime: HFModelRuntime,
     episode_states: list[_EpisodeTrainState],
     settings: Phase3Settings,
+    off_samples_train: list[dict[str, Any]] | None = None,
+    off_samples_fixed: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     torch_mod = runtime.torch
     params = [state.logits for state in episode_states]
     optimizer = torch_mod.optim.Adam(params, lr=settings.train_lr)
+    device = episode_states[0].logits.device
 
     lambda_off_current = float(settings.lambda_off)
     p99_ema: float | None = None
     loss_curve: list[dict[str, float]] = []
     lambda_trace: list[dict[str, float]] = []
     topk_trace: list[dict[str, float]] = []
+    train_inputs = off_samples_train or [{"sample_id": "off_train_default_0", "query_text": "default off train"}]
+    fixed_inputs = off_samples_fixed or train_inputs
+    train_factors = _off_prompt_factors_tensor(
+        torch_mod=torch_mod,
+        off_samples=train_inputs,
+        device=device,
+    )
+    fixed_factors = _off_prompt_factors_tensor(
+        torch_mod=torch_mod,
+        off_samples=fixed_inputs,
+        device=device,
+    )
 
     for step in range(settings.train_steps):
         progress = 0.0 if settings.train_steps <= 1 else step / float(settings.train_steps - 1)
@@ -760,7 +822,6 @@ def _optimize_episode_states(
                 logits=state.logits,
                 topk=topk,
                 atom_types=state.atom_types,
-                delimiter_mass_penalty=settings.delimiter_mass_penalty,
             )
             on_vec = _atom_type_vector(
                 torch_mod=torch_mod,
@@ -804,12 +865,30 @@ def _optimize_episode_states(
 
         on_proxy = torch_mod.stack(on_proxy_values).mean()
         off_proxy_tensor = torch_mod.stack(off_proxy_values)
-        loss_on = -on_proxy
-        loss_off = _cvar_tail_mean_torch(
+        train_stress = _stress_by_prompt(
             torch_mod=torch_mod,
-            values=off_proxy_tensor,
-            tail_fraction=settings.cvar_tail_fraction,
+            state_values=off_proxy_tensor,
+            prompt_factors=train_factors,
         )
+        fixed_stress = _stress_by_prompt(
+            torch_mod=torch_mod,
+            state_values=off_proxy_tensor,
+            prompt_factors=fixed_factors,
+        )
+        hard_pool_tensor = _hard_pool_tensor(
+            torch_mod=torch_mod,
+            values=train_stress,
+            pool_size=settings.off_hard_pool_size,
+        )
+
+        loss_on = -on_proxy
+        if settings.off_train_source == "hard_pool":
+            off_for_train = hard_pool_tensor
+        elif settings.off_train_source == "fixed_stress_eval":
+            off_for_train = fixed_stress
+        else:
+            raise ValueError(f"Unsupported off_train_source: {settings.off_train_source}")
+        loss_off = _cvar_tail_mean_torch(torch_mod=torch_mod, values=off_for_train, tail_fraction=settings.cvar_tail_fraction)
         loss_str = (
             torch_mod.stack(entropy_values).mean()
             + torch_mod.stack(overlap_values).mean()
@@ -822,9 +901,17 @@ def _optimize_episode_states(
         torch_mod.nn.utils.clip_grad_norm_(params, settings.train_grad_clip)
         optimizer.step()
 
-        p99_raw = percentile(
-            [float(value) for value in off_proxy_tensor.detach().cpu().tolist()],
-            0.99,
+        hard_pool_p99 = percentile([float(value) for value in hard_pool_tensor.detach().cpu().tolist()], 0.99)
+        fixed_p99 = percentile([float(value) for value in fixed_stress.detach().cpu().tolist()], 0.99)
+        constraint_p99 = select_constraint_p99(
+            metric_source=settings.off_constraint_source,
+            fixed_p99=fixed_p99,
+            hard_pool_p99=hard_pool_p99,
+        )
+        p99_raw = select_constraint_p99(
+            metric_source=settings.dual_metric_source,
+            fixed_p99=fixed_p99,
+            hard_pool_p99=hard_pool_p99,
         )
         if p99_ema is None:
             p99_ema = p99_raw
@@ -857,6 +944,12 @@ def _optimize_episode_states(
                 "loss_off": float(loss_off.detach().cpu().item()),
                 "loss_str": float(loss_str.detach().cpu().item()),
                 "proxy_off_p99": float(p99_raw),
+                "off_p99_constraint": float(constraint_p99),
+                "off_p99_fixed": float(fixed_p99),
+                "off_p99_hard_pool": float(hard_pool_p99),
+                "off_train_source": settings.off_train_source,
+                "off_constraint_source": settings.off_constraint_source,
+                "dual_metric_source": settings.dual_metric_source,
                 "lambda_off": float(lambda_off_current),
             }
         )
@@ -1269,7 +1362,6 @@ def _slot_weights_from_logits_tensor(
     logits: Any,
     topk: int,
     atom_types: list[str],
-    delimiter_mass_penalty: float,
 ) -> Any:
     probs = torch_mod.softmax(logits, dim=-1)
     topk_eff = max(1, min(int(topk), int(probs.shape[-1])))
@@ -1279,14 +1371,7 @@ def _slot_weights_from_logits_tensor(
         mask.scatter_(dim=-1, index=indices, value=1.0)
         probs = probs * mask
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    delimiter_mask = _delimiter_mask_tensor(
-        torch_mod=torch_mod,
-        atom_types=atom_types,
-        device=logits.device,
-    )
-    penalized = probs * (1.0 - delimiter_mass_penalty * delimiter_mask)
-    penalized = penalized / penalized.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    return penalized
+    return probs
 
 
 def _atom_type_vector(
@@ -1343,7 +1428,6 @@ def _final_slot_weights_from_logits(
             logits=logits,
             topk=topk,
             atom_types=atom_types,
-            delimiter_mass_penalty=settings.delimiter_mass_penalty,
         ).detach().cpu().tolist()
     if settings.delimiter_apply_stage != "post_topk_renorm_per_slot":
         raise ValueError(f"Unsupported delimiter apply stage: {settings.delimiter_apply_stage}")
