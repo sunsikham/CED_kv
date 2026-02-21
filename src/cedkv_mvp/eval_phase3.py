@@ -110,6 +110,16 @@ class FixedStressEvalSpec:
     definition: str
 
 
+@dataclass
+class _EpisodeTrainState:
+    sample: dict[str, Any]
+    atoms: list[dict[str, str]]
+    atom_types: list[str]
+    warm_scores: list[float]
+    warm_anchor_ids: list[int]
+    logits: Any
+
+
 def resolve_phase3_settings(
     config: dict[str, Any],
     model_id_override: str | None = None,
@@ -279,6 +289,7 @@ def run_phase3(
         sampling=settings.off_fixed_stress_sampling,
         definition=settings.off_fixed_stress_definition,
     )
+    scope_consistency = _validate_scope_consistency(settings=settings)
     off_samples_fixed = build_fixed_stress_eval_samples(spec=fixed_spec)
 
     gatea_artifacts: dict[str, Any] = {"gateA_kv_meta": [], "hf_runtime_meta": {}}
@@ -307,12 +318,28 @@ def run_phase3(
         },
         "phase3_lambda_off_trace": [],
         "phase3_topk_schedule_trace": [],
+        "phase3_loss_curve": [],
         "phase3_atom_type_mass": [],
     }
 
-    state_pool = _build_phase3_state_pool(
+    episode_states = _prepare_episode_train_states(
         runtime=runtime,
         on_samples=on_samples,
+        settings=settings,
+        artifacts=artifacts,
+    )
+    train_result = _optimize_episode_states(
+        runtime=runtime,
+        episode_states=episode_states,
+        settings=settings,
+    )
+    artifacts["phase3_lambda_off_trace"] = train_result["lambda_trace"]
+    artifacts["phase3_topk_schedule_trace"] = train_result["topk_trace"]
+    artifacts["phase3_loss_curve"] = train_result["loss_curve"]
+
+    state_pool = _build_phase3_state_pool(
+        runtime=runtime,
+        episode_states=episode_states,
         settings=settings,
         artifacts=artifacts,
     )
@@ -347,26 +374,7 @@ def run_phase3(
     loss_on = on_eval["on_kl_mean"]
     loss_str = _structural_loss(state_pool=state_pool, settings=settings)
 
-    p99_for_constraint = select_constraint_p99(
-        metric_source=settings.dual_metric_source,
-        fixed_p99=off_fixed_eval["off_delta_p99_stress"],
-        hard_pool_p99=percentile(hard_pool, 0.99) if hard_pool else off_fixed_eval["off_delta_p99_stress"],
-    )
-    lambda_trace = run_dual_lambda_update_trace(
-        steps=settings.train_steps,
-        lambda_init=settings.lambda_off,
-        eta=settings.dual_eta,
-        threshold=settings.off_delta_p99_max,
-        p99_raw_values=[p99_for_constraint for _ in range(settings.train_steps)],
-        ema_beta=settings.dual_ema_beta,
-        update_every=settings.dual_update_every,
-        lambda_min=settings.dual_lambda_min,
-        lambda_max=settings.dual_lambda_max,
-        delta_clip=settings.dual_delta_clip,
-        adaptive=settings.lambda_off_adaptive,
-    )
-    artifacts["phase3_lambda_off_trace"] = lambda_trace
-    artifacts["phase3_topk_schedule_trace"] = _build_topk_schedule_trace(settings=settings)
+    lambda_trace = artifacts["phase3_lambda_off_trace"]
 
     gateb = _build_gateb_result(
         settings=settings,
@@ -420,6 +428,7 @@ def run_phase3(
         "injection_scope": settings.layer_scope_injection,
         "mix_mode": settings.mix_mode,
         "k_anchor_policy": settings.k_anchor_policy,
+        "scope_consistency": scope_consistency,
         "off_loss": {
             "type": settings.off_loss_type,
             "cvar_tail_fraction": settings.cvar_tail_fraction,
@@ -644,59 +653,55 @@ def _resolve_hf_runtime(settings: Phase3Settings) -> HFModelRuntime:
     return load_hf_model(model_id=settings.model_id, device=settings.device, torch_dtype=settings.torch_dtype)
 
 
-def _build_phase3_state_pool(
+def _validate_scope_consistency(settings: Phase3Settings) -> dict[str, Any]:
+    allowed = {"top25", "all"}
+    if settings.layer_scope_mixture not in allowed:
+        raise ValueError(f"Unsupported phase3.layer_scope.mixture: {settings.layer_scope_mixture}")
+    if settings.layer_scope_injection not in allowed:
+        raise ValueError(f"Unsupported phase3.layer_scope.injection: {settings.layer_scope_injection}")
+    if settings.mix_mode not in {"v_only", "kv_raw"}:
+        raise ValueError(f"Unsupported phase3.mix.mode: {settings.mix_mode}")
+    return {
+        "checked": True,
+        "mixture": settings.layer_scope_mixture,
+        "injection": settings.layer_scope_injection,
+        "mix_mode": settings.mix_mode,
+        "consistent": True,
+    }
+
+
+def _prepare_episode_train_states(
     runtime: HFModelRuntime,
     on_samples: list[dict[str, Any]],
     settings: Phase3Settings,
     artifacts: dict[str, Any],
-) -> list[dict[str, Any]]:
-    state_pool: list[dict[str, Any]] = []
-    type_mass_agg: dict[str, float] = {}
-
-    for idx, sample in enumerate(on_samples):
+) -> list[_EpisodeTrainState]:
+    states: list[_EpisodeTrainState] = []
+    for sample in on_samples:
         atoms = _build_candidate_atoms(sample=sample, atom_types=settings.atom_types)
+        atom_types = [atom["atom_type"] for atom in atoms]
         warm_scores = _warm_start_scores(
-            atom_types=[atom["atom_type"] for atom in atoms],
+            atom_types=atom_types,
             anti_steer_strength=settings.anti_steer_strength,
         )
-        topk_final = settings.topk_schedule[-1]
-        slot_weights, anchor_ids = _build_slot_weights(
+        warm_anchor_ids = _warm_anchor_ids_from_scores(
             scores=warm_scores,
-            atom_types=[atom["atom_type"] for atom in atoms],
             slot_count=settings.span_budget,
-            topk=topk_final,
-            delimiter_mass_cap=settings.delimiter_mass_cap,
-            delimiter_mass_penalty=settings.delimiter_mass_penalty,
-            delimiter_apply_stage=settings.delimiter_apply_stage,
         )
-        warm_anchor_ids = [int(max(range(len(weights)), key=lambda i: weights[i])) for weights in slot_weights]
-        anchor_ids = [
-            select_k_anchor_index(
-                weights=weights,
-                warm_start_index=warm_anchor,
-                policy=settings.k_anchor_policy,
+        logits = _init_slot_logits(
+            runtime=runtime,
+            warm_scores=warm_scores,
+            slot_count=settings.span_budget,
+        )
+        states.append(
+            _EpisodeTrainState(
+                sample=sample,
+                atoms=atoms,
+                atom_types=atom_types,
+                warm_scores=warm_scores,
+                warm_anchor_ids=warm_anchor_ids,
+                logits=logits,
             )
-            for weights, warm_anchor in zip(slot_weights, warm_anchor_ids)
-        ]
-
-        for atom_type in ("entry", "key_only", "value_only", "delimiter_only"):
-            avg = _average_atom_mass(slot_weights=slot_weights, atom_types=[atom["atom_type"] for atom in atoms], target_type=atom_type)
-            type_mass_agg[atom_type] = type_mass_agg.get(atom_type, 0.0) + avg
-
-        state_text = "".join(str(atoms[anchor_id]["text"]) for anchor_id in anchor_ids if 0 <= anchor_id < len(atoms))
-        compact_text = _truncate_to_prefix_text(runtime=runtime, text=state_text, prefix_len=settings.prefix_len)
-        capture = _capture_compact_prefix(runtime=runtime, compact_text=compact_text)
-        state_pool.append(
-            {
-                "state_id": f"phase3_on_{idx}",
-                "past_key_values": capture["past_key_values"],
-                "past_len": capture["past_len"],
-                "episode_id": sample["episode_id"],
-                "atom_count": len(atoms),
-                "anchor_ids": anchor_ids,
-                "slot_weights": slot_weights,
-                "atom_types": [atom["atom_type"] for atom in atoms],
-            }
         )
         artifacts["phase3_candidate_atoms"].append(
             {
@@ -705,12 +710,230 @@ def _build_phase3_state_pool(
                 "atom_count": len(atoms),
                 "atoms": atoms,
                 "warm_scores": warm_scores,
+                "warm_anchor_ids": warm_anchor_ids,
+            }
+        )
+    if not states:
+        raise ValueError("phase3 requires at least one ON sample")
+    return states
+
+
+def _optimize_episode_states(
+    runtime: HFModelRuntime,
+    episode_states: list[_EpisodeTrainState],
+    settings: Phase3Settings,
+) -> dict[str, Any]:
+    torch_mod = runtime.torch
+    params = [state.logits for state in episode_states]
+    optimizer = torch_mod.optim.Adam(params, lr=settings.train_lr)
+
+    lambda_off_current = float(settings.lambda_off)
+    p99_ema: float | None = None
+    loss_curve: list[dict[str, float]] = []
+    lambda_trace: list[dict[str, float]] = []
+    topk_trace: list[dict[str, float]] = []
+
+    for step in range(settings.train_steps):
+        progress = 0.0 if settings.train_steps <= 1 else step / float(settings.train_steps - 1)
+        topk = _topk_for_progress(
+            progress=progress,
+            schedule=settings.topk_schedule,
+            milestones=settings.topk_milestones,
+        )
+        topk_trace.append(
+            {
+                "step": float(step),
+                "progress": progress,
+                "topk": float(topk),
+            }
+        )
+
+        on_proxy_values: list[Any] = []
+        off_proxy_values: list[Any] = []
+        entropy_values: list[Any] = []
+        overlap_values: list[Any] = []
+        delimiter_overage_values: list[Any] = []
+
+        for state in episode_states:
+            slot_weights = _slot_weights_from_logits_tensor(
+                torch_mod=torch_mod,
+                logits=state.logits,
+                topk=topk,
+                atom_types=state.atom_types,
+                delimiter_mass_penalty=settings.delimiter_mass_penalty,
+            )
+            on_vec = _atom_type_vector(
+                torch_mod=torch_mod,
+                atom_types=state.atom_types,
+                mapping={
+                    "entry": 1.0,
+                    "key_only": 0.85,
+                    "value_only": 0.6,
+                    "delimiter_only": 0.1,
+                },
+                device=state.logits.device,
+            )
+            off_vec = _atom_type_vector(
+                torch_mod=torch_mod,
+                atom_types=state.atom_types,
+                mapping={
+                    "entry": 0.25,
+                    "key_only": 0.2,
+                    "value_only": 0.55,
+                    "delimiter_only": 1.0,
+                },
+                device=state.logits.device,
+            )
+            slot_on_scores = (slot_weights * on_vec).sum(dim=-1)
+            slot_off_scores = (slot_weights * off_vec).sum(dim=-1)
+            delimiter_mask = _delimiter_mask_tensor(
+                torch_mod=torch_mod,
+                atom_types=state.atom_types,
+                device=state.logits.device,
+            )
+            delimiter_mass = (slot_weights * delimiter_mask).sum(dim=-1)
+            delimiter_overage = torch_mod.relu(delimiter_mass - settings.delimiter_mass_cap).mean()
+            entropy = _slot_entropy_mean(torch_mod=torch_mod, slot_weights=slot_weights)
+            overlap = _slot_overlap_penalty(torch_mod=torch_mod, slot_weights=slot_weights)
+
+            on_proxy_values.append(slot_on_scores.mean())
+            off_proxy_values.append(slot_off_scores.max())  # stress-like proxy
+            entropy_values.append(entropy)
+            overlap_values.append(overlap)
+            delimiter_overage_values.append(delimiter_overage)
+
+        on_proxy = torch_mod.stack(on_proxy_values).mean()
+        off_proxy_tensor = torch_mod.stack(off_proxy_values)
+        loss_on = -on_proxy
+        loss_off = _cvar_tail_mean_torch(
+            torch_mod=torch_mod,
+            values=off_proxy_tensor,
+            tail_fraction=settings.cvar_tail_fraction,
+        )
+        loss_str = (
+            torch_mod.stack(entropy_values).mean()
+            + torch_mod.stack(overlap_values).mean()
+            + settings.delimiter_mass_penalty * torch_mod.stack(delimiter_overage_values).mean()
+        )
+        total_loss = settings.lambda_on * loss_on + lambda_off_current * loss_off + settings.lambda_str * loss_str
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch_mod.nn.utils.clip_grad_norm_(params, settings.train_grad_clip)
+        optimizer.step()
+
+        p99_raw = percentile(
+            [float(value) for value in off_proxy_tensor.detach().cpu().tolist()],
+            0.99,
+        )
+        if p99_ema is None:
+            p99_ema = p99_raw
+        else:
+            p99_ema = settings.dual_ema_beta * p99_ema + (1.0 - settings.dual_ema_beta) * p99_raw
+        delta = 0.0
+        if settings.lambda_off_adaptive and (step % settings.dual_update_every == 0):
+            raw_delta = settings.dual_eta * (p99_ema - settings.off_delta_p99_max)
+            delta = max(-settings.dual_delta_clip, min(settings.dual_delta_clip, raw_delta))
+            lambda_off_current = max(
+                settings.dual_lambda_min,
+                min(settings.dual_lambda_max, lambda_off_current + delta),
+            )
+        lambda_trace.append(
+            {
+                "step": float(step),
+                "p99_raw": float(p99_raw),
+                "p99_ema": float(p99_ema),
+                "lambda_off": float(lambda_off_current),
+                "delta": float(delta),
+            }
+        )
+        loss_curve.append(
+            {
+                "step": float(step),
+                "progress": progress,
+                "topk": float(topk),
+                "loss_total": float(total_loss.detach().cpu().item()),
+                "loss_on": float(loss_on.detach().cpu().item()),
+                "loss_off": float(loss_off.detach().cpu().item()),
+                "loss_str": float(loss_str.detach().cpu().item()),
+                "proxy_off_p99": float(p99_raw),
+                "lambda_off": float(lambda_off_current),
+            }
+        )
+
+    return {
+        "lambda_trace": lambda_trace,
+        "topk_trace": topk_trace,
+        "loss_curve": loss_curve,
+    }
+
+
+def _build_phase3_state_pool(
+    runtime: HFModelRuntime,
+    episode_states: list[_EpisodeTrainState],
+    settings: Phase3Settings,
+    artifacts: dict[str, Any],
+) -> list[dict[str, Any]]:
+    state_pool: list[dict[str, Any]] = []
+    type_mass_agg: dict[str, float] = {}
+
+    topk_final = _topk_for_progress(
+        progress=1.0,
+        schedule=settings.topk_schedule,
+        milestones=settings.topk_milestones,
+    )
+    for idx, state in enumerate(episode_states):
+        slot_weights = _final_slot_weights_from_logits(
+            runtime=runtime,
+            logits=state.logits,
+            topk=topk_final,
+            atom_types=state.atom_types,
+            settings=settings,
+        )
+        anchor_ids = [
+            select_k_anchor_index(
+                weights=weights,
+                warm_start_index=warm_anchor,
+                policy=settings.k_anchor_policy,
+            )
+            for weights, warm_anchor in zip(slot_weights, state.warm_anchor_ids)
+        ]
+        k_anchor_fixed_ok = all(
+            int(anchor_id) == int(warm_anchor_id)
+            for anchor_id, warm_anchor_id in zip(anchor_ids, state.warm_anchor_ids)
+        )
+
+        for atom_type in ("entry", "key_only", "value_only", "delimiter_only"):
+            avg = _average_atom_mass(
+                slot_weights=slot_weights,
+                atom_types=state.atom_types,
+                target_type=atom_type,
+            )
+            type_mass_agg[atom_type] = type_mass_agg.get(atom_type, 0.0) + avg
+
+        state_text = _compose_state_text_from_weights(
+            atoms=state.atoms,
+            slot_weights=slot_weights,
+            fallback_anchor_ids=anchor_ids,
+        )
+        compact_text = _truncate_to_prefix_text(runtime=runtime, text=state_text, prefix_len=settings.prefix_len)
+        capture = _capture_compact_prefix(runtime=runtime, compact_text=compact_text)
+        state_pool.append(
+            {
+                "state_id": f"phase3_on_{idx}",
+                "past_key_values": capture["past_key_values"],
+                "past_len": capture["past_len"],
+                "episode_id": state.sample["episode_id"],
+                "atom_count": len(state.atoms),
+                "anchor_ids": anchor_ids,
+                "slot_weights": slot_weights,
+                "atom_types": state.atom_types,
             }
         )
         artifacts["phase3_state_pool_meta"].append(
             {
                 "state_id": f"phase3_on_{idx}",
-                "episode_id": sample["episode_id"],
+                "episode_id": state.sample["episode_id"],
                 "k_anchor_policy": settings.k_anchor_policy,
                 "layer_scope_mixture": settings.layer_scope_mixture,
                 "layer_scope_injection": settings.layer_scope_injection,
@@ -718,6 +941,9 @@ def _build_phase3_state_pool(
                 "prefix_len": settings.prefix_len,
                 "effective_prefix_len": capture["past_len"],
                 "anchor_ids": anchor_ids,
+                "warm_anchor_ids": state.warm_anchor_ids,
+                "k_anchor_fixed_ok": k_anchor_fixed_ok,
+                "topk_final": topk_final,
             }
         )
 
@@ -1015,6 +1241,139 @@ def _build_candidate_atoms(sample: dict[str, Any], atom_types: tuple[str, ...]) 
     if not atoms:
         atoms.append({"atom_type": "entry", "text": demo_text})
     return atoms
+
+
+def _warm_anchor_ids_from_scores(scores: list[float], slot_count: int) -> list[int]:
+    ranked = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    if not ranked:
+        return [0 for _ in range(slot_count)]
+    return [int(ranked[idx % len(ranked)]) for idx in range(slot_count)]
+
+
+def _init_slot_logits(
+    runtime: HFModelRuntime,
+    warm_scores: list[float],
+    slot_count: int,
+) -> Any:
+    torch_mod = runtime.torch
+    device = runtime.model.device
+    base = torch_mod.tensor(warm_scores, dtype=torch_mod.float32, device=device)
+    tiled = base.unsqueeze(0).repeat(slot_count, 1)
+    slot_bias = torch_mod.linspace(0.0, -0.2, steps=slot_count, dtype=torch_mod.float32, device=device).unsqueeze(1)
+    param = torch_mod.nn.Parameter(tiled + slot_bias)
+    return param
+
+
+def _slot_weights_from_logits_tensor(
+    torch_mod: Any,
+    logits: Any,
+    topk: int,
+    atom_types: list[str],
+    delimiter_mass_penalty: float,
+) -> Any:
+    probs = torch_mod.softmax(logits, dim=-1)
+    topk_eff = max(1, min(int(topk), int(probs.shape[-1])))
+    if topk_eff < int(probs.shape[-1]):
+        _, indices = torch_mod.topk(probs, k=topk_eff, dim=-1)
+        mask = torch_mod.zeros_like(probs)
+        mask.scatter_(dim=-1, index=indices, value=1.0)
+        probs = probs * mask
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    delimiter_mask = _delimiter_mask_tensor(
+        torch_mod=torch_mod,
+        atom_types=atom_types,
+        device=logits.device,
+    )
+    penalized = probs * (1.0 - delimiter_mass_penalty * delimiter_mask)
+    penalized = penalized / penalized.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return penalized
+
+
+def _atom_type_vector(
+    torch_mod: Any,
+    atom_types: list[str],
+    mapping: dict[str, float],
+    device: Any,
+) -> Any:
+    values = [float(mapping.get(atom_type, 0.0)) for atom_type in atom_types]
+    return torch_mod.tensor(values, dtype=torch_mod.float32, device=device).unsqueeze(0)
+
+
+def _delimiter_mask_tensor(torch_mod: Any, atom_types: list[str], device: Any) -> Any:
+    values = [1.0 if atom_type == "delimiter_only" else 0.0 for atom_type in atom_types]
+    return torch_mod.tensor(values, dtype=torch_mod.float32, device=device).unsqueeze(0)
+
+
+def _slot_entropy_mean(torch_mod: Any, slot_weights: Any) -> Any:
+    probs = slot_weights.clamp_min(1e-12)
+    entropy = -(probs * probs.log()).sum(dim=-1)
+    return entropy.mean()
+
+
+def _slot_overlap_penalty(torch_mod: Any, slot_weights: Any) -> Any:
+    if int(slot_weights.shape[0]) <= 1:
+        return slot_weights.new_tensor(0.0)
+    normalized = slot_weights / slot_weights.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    sim = normalized @ normalized.transpose(0, 1)
+    slot_count = int(slot_weights.shape[0])
+    upper = torch_mod.triu(torch_mod.ones((slot_count, slot_count), device=slot_weights.device), diagonal=1)
+    values = sim * upper
+    denom = upper.sum().clamp_min(1.0)
+    return values.sum() / denom
+
+
+def _cvar_tail_mean_torch(torch_mod: Any, values: Any, tail_fraction: float) -> Any:
+    sorted_values, _ = torch_mod.sort(values.reshape(-1))
+    tail_count = max(1, int(math.ceil(int(sorted_values.shape[0]) * tail_fraction)))
+    tail = sorted_values[-tail_count:]
+    return tail.mean()
+
+
+def _final_slot_weights_from_logits(
+    runtime: HFModelRuntime,
+    logits: Any,
+    topk: int,
+    atom_types: list[str],
+    settings: Phase3Settings,
+) -> list[list[float]]:
+    torch_mod = runtime.torch
+    with torch_mod.no_grad():
+        weights = _slot_weights_from_logits_tensor(
+            torch_mod=torch_mod,
+            logits=logits,
+            topk=topk,
+            atom_types=atom_types,
+            delimiter_mass_penalty=settings.delimiter_mass_penalty,
+        ).detach().cpu().tolist()
+    if settings.delimiter_apply_stage != "post_topk_renorm_per_slot":
+        raise ValueError(f"Unsupported delimiter apply stage: {settings.delimiter_apply_stage}")
+    return [
+        apply_delimiter_mass_constraints(
+            weights=[float(value) for value in row],
+            atom_types=atom_types,
+            mass_cap=settings.delimiter_mass_cap,
+            mass_penalty=settings.delimiter_mass_penalty,
+        )
+        for row in weights
+    ]
+
+
+def _compose_state_text_from_weights(
+    atoms: list[dict[str, str]],
+    slot_weights: list[list[float]],
+    fallback_anchor_ids: list[int],
+) -> str:
+    selected_ids: list[int] = []
+    for row in slot_weights:
+        ranked = sorted(range(len(row)), key=lambda idx: row[idx], reverse=True)
+        for idx in ranked[:2]:
+            if idx not in selected_ids:
+                selected_ids.append(idx)
+    if not selected_ids:
+        selected_ids = [idx for idx in fallback_anchor_ids if 0 <= idx < len(atoms)]
+    if not selected_ids:
+        selected_ids = list(range(min(1, len(atoms))))
+    return "".join(str(atoms[idx]["text"]) for idx in selected_ids if 0 <= idx < len(atoms))
 
 
 def _warm_start_scores(atom_types: list[str], anti_steer_strength: float) -> list[float]:
