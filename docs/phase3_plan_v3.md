@@ -36,6 +36,12 @@
 21. `phase3.milestone.explore.enabled = true`.
 22. `phase3.milestone.explore.flag = phase3_explore`.
 23. `phase3.milestone.explore.max_runs = 5`.
+24. `phase3.runtime.policy_mode = prod | debug` (기본 `prod`).
+25. `phase3.runtime.debug_allow_nonfixed_constraint_sources = false` (debug 모드에서만 유효).
+26. `phase3.train.constraint_warn.enabled = true`.
+27. `phase3.train.constraint_warn.patience_eval_ticks = 3`.
+28. `phase3.train.constraint_warn.margin = 0.0`.
+29. `phase3.train.constraint_warn.eval_every = 1`.
 
 ## 구현 규칙 고정
 1. CVaR는 "상위 `tail_fraction` 평균"으로 계산한다.
@@ -53,6 +59,11 @@
 13. K anchor는 슬롯별 warm-start 시점의 `anchor_chunk/layer/position`을 전 학습 단계에서 고정한다.
 14. delimiter cap/penalty는 슬롯별 top-k renorm 이후 확률질량에 적용한다.
 15. delimiter 제약은 `per-slot`로 먼저 적용하고, run-level에서는 타입별 총 질량을 로깅한다.
+16. 운영(`policy_mode=prod`)에서는 `constraint_source`/`dual.metric_source`를 `fixed_stress_eval`로 강제한다.
+17. `CI=true`면 `policy_mode` 입력값과 무관하게 내부적으로 `prod`를 강제한다.
+18. `off_train_source`는 운영에서도 `hard_pool` 허용(훈련 안정화 목적).
+19. warn-only 카운트는 optimization step이 아니라 eval tick(`eval_every`) 기준으로 누적한다.
+20. warn 지표는 `off_delta_p99_stress` 축과 동일 기준(고정 eval source + threshold/margin)으로 해석한다.
 
 ## 성공 기준 분리
 1. Gate 성공 기준(출시/판정용):

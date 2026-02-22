@@ -14,6 +14,30 @@
 
 ## 남은 핵심 작업 (우선순위 순)
 
+### A. 보강 3개 (현재 리스크 기준, CPU 우선 가능, 우선순위: 3 -> 1 -> 2)
+
+1. [~] (3번) `off_constraint_source` 역할 명확화 및 실행 경로 반영 강화
+- 완료:
+  - optimizer 루프에서 `off_constraint_source`/`dual_metric_source` 분기 반영.
+  - `phase3_loss_off` 리포트가 `off_train_source`와 정합되도록 수정.
+  - 관련 테스트 추가(`optimizer_source_routing`, `report_loss_off_source_alignment`).
+  - `policy_mode(prod|debug)` + `CI=true -> prod` 강제 규칙 반영.
+  - 운영 모드에서 non-fixed constraint/dual source 차단, debug override 경로 분리.
+  - warn-only eval tick 추적 및 `phase3_constraint_warn_trace` 아티팩트 추가.
+- 남음:
+  - warn metric을 gate 축(`off_delta_p99_stress`)과 직접 결합한 고비용 검증 경로를 붙일지 결정.
+  - early-stop/abort 기준을 실제로 도입할지(현재 warn-only) 최종 결정.
+
+2. [ ] (1번) `layer_scope` / `mix_mode`를 실제 연산 경로에 연결
+- 현재는 검증/리포트/메타 중심이라, 설정 변경 시 실제 학습 경로 변화가 제한적일 수 있음.
+- 목표: `mixture_scope`, `injection_scope`, `mix_mode(v_only 등)`가 실제 forward/mix 계산 분기까지 영향을 주도록 코드 경로를 명시적으로 연결.
+
+3. [ ] (2번) Proxy loss와 실제 Gate 지표 정합 강화
+- 현재 `L_on/L_off`는 proxy 중심이라 Gate 지표(ON 품질, OFF p99)와 직접 정합이 약할 수 있음.
+- 목표: step-wise로 proxy와 실제 지표(KL/정답 관련 지표/p99)의 상관을 로깅하고, 필요 시 일부 loss 항을 HF forward 기반 실측 지표로 치환/혼합.
+
+### B. 기존 구현 항목 고도화
+
 1. 학습 루프 실체화(최우선)
 - 슬롯 mixture 파라미터(`w_{s,j}`)를 실제 optimizer로 업데이트.
 - step 단위로 `top-k schedule (32->16->8->4)`가 실제 mixture 계산에 반영되도록 연결.

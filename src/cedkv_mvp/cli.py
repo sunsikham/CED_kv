@@ -582,6 +582,7 @@ def _write_phase3_artifacts(artifacts_dir: Path, artifacts: dict[str, Any]) -> N
         "phase3_lambda_off_trace": phase3_dir / "lambda_off_trace.json",
         "phase3_topk_schedule_trace": phase3_dir / "topk_schedule_trace.json",
         "phase3_loss_curve": phase3_dir / "loss_curve.json",
+        "phase3_constraint_warn_trace": phase3_dir / "constraint_warn_trace.json",
         "phase3_atom_type_mass": phase3_dir / "atom_type_mass.json",
         "hf_runtime_meta": phase3_dir / "hf_runtime_meta.json",
     }

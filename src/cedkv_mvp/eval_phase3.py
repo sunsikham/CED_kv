@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+import os
 import random
 from typing import Any
 
@@ -59,10 +60,18 @@ class Phase3Settings:
     cvar_tail_fraction: float
     off_train_source: str
     off_constraint_source: str
+    policy_mode: str
+    policy_mode_effective: str
+    ci_forced_prod: bool
+    debug_allow_nonfixed_constraint_sources: bool
     off_hard_pool_size: int
     train_steps: int
     train_lr: float
     train_grad_clip: float
+    constraint_warn_enabled: bool
+    constraint_warn_patience_eval_ticks: int
+    constraint_warn_margin: float
+    constraint_eval_every: int
     topk_schedule: tuple[int, ...]
     topk_milestones: tuple[float, ...]
     lambda_on: float
@@ -145,6 +154,7 @@ def resolve_phase3_settings(
     evaluation = phase3.get("eval", {})
     train = phase3.get("train", {})
     loss = phase3.get("loss", {})
+    off_loss_cfg = loss.get("off", loss.get(False, {})) if isinstance(loss, dict) else {}
     mix = phase3.get("mix", {})
     candidate = phase3.get("candidate", {})
     delimiter = candidate.get("delimiter", {})
@@ -154,6 +164,7 @@ def resolve_phase3_settings(
     reporting = phase3.get("reporting", {})
     milestone = phase3.get("milestone", {}).get("explore", {})
     dual = train.get("lambda_off", {}).get("dual", {})
+    constraint_warn = train.get("constraint_warn", {})
     phase2_thresholds = phase2.get("thresholds", {})
     phase2_eval = phase2.get("eval", {})
     phase2_select = phase2.get("select", {})
@@ -181,17 +192,59 @@ def resolve_phase3_settings(
     atom_types = tuple(str(item) for item in atom_types_raw)
     if not atom_types:
         raise ValueError("phase3.candidate.atom_types must not be empty")
-    if loss.get("off", {}).get("type", loss.get("off_type", "cvar")) != "cvar" and (
-        off_loss_type_override or loss.get("off", {}).get("type", loss.get("off_type", "cvar"))
+    if off_loss_cfg.get("type", loss.get("off_type", "cvar")) != "cvar" and (
+        off_loss_type_override or off_loss_cfg.get("type", loss.get("off_type", "cvar"))
     ) != "cvar":
         raise ValueError("phase3 currently supports only loss.off.type=cvar")
 
     if cvar_tail_fraction_override is not None:
         cvar_tail_fraction = float(cvar_tail_fraction_override)
     else:
-        cvar_tail_fraction = float(loss.get("off", {}).get("cvar_tail_fraction", loss.get("cvar_tail_fraction", 0.2)))
+        cvar_tail_fraction = float(off_loss_cfg.get("cvar_tail_fraction", loss.get("cvar_tail_fraction", 0.2)))
     if not (0.0 < cvar_tail_fraction <= 1.0):
         raise ValueError("phase3.loss.off.cvar_tail_fraction must be in (0,1]")
+
+    off_train_source = str(off_loss_cfg.get("train_source", "hard_pool"))
+    off_constraint_source = str(off_loss_cfg.get("constraint_source", "fixed_stress_eval"))
+    dual_metric_source = str(dual.get("metric_source", "fixed_stress_eval"))
+    if off_train_source not in {"hard_pool", "fixed_stress_eval"}:
+        raise ValueError(f"Unsupported phase3.loss.off.train_source: {off_train_source}")
+    for source_name, source_value in (
+        ("phase3.loss.off.constraint_source", off_constraint_source),
+        ("phase3.train.lambda_off.dual.metric_source", dual_metric_source),
+    ):
+        if source_value not in {"fixed_stress_eval", "hard_pool"}:
+            raise ValueError(f"Unsupported {source_name}: {source_value}")
+
+    policy_mode = str(runtime.get("policy_mode", "prod"))
+    if policy_mode not in {"prod", "debug"}:
+        raise ValueError(f"Unsupported phase3.runtime.policy_mode: {policy_mode}")
+    debug_allow_nonfixed_constraint_sources = bool(runtime.get("debug_allow_nonfixed_constraint_sources", False))
+    ci_forced_prod = os.getenv("CI", "").strip().lower() in {"1", "true", "yes"}
+    policy_mode_effective = "prod" if ci_forced_prod else policy_mode
+    nonfixed_requested = (
+        off_constraint_source != "fixed_stress_eval"
+        or dual_metric_source != "fixed_stress_eval"
+    )
+    if policy_mode_effective == "prod" and nonfixed_requested:
+        raise ValueError(
+            "phase3 runtime policy_mode=prod requires fixed_stress_eval for "
+            "loss.off.constraint_source and train.lambda_off.dual.metric_source"
+        )
+    if (
+        policy_mode_effective == "debug"
+        and nonfixed_requested
+        and not debug_allow_nonfixed_constraint_sources
+    ):
+        raise ValueError(
+            "phase3 runtime policy_mode=debug requires "
+            "runtime.debug_allow_nonfixed_constraint_sources=true for non-fixed sources"
+        )
+
+    constraint_warn_enabled = bool(constraint_warn.get("enabled", True))
+    constraint_warn_patience_eval_ticks = max(1, int(constraint_warn.get("patience_eval_ticks", 3)))
+    constraint_warn_margin = max(0.0, float(constraint_warn.get("margin", 0.0)))
+    constraint_eval_every = max(1, int(constraint_warn.get("eval_every", 1)))
 
     return Phase3Settings(
         model_id=model_id,
@@ -216,14 +269,22 @@ def resolve_phase3_settings(
         delimiter_apply_stage=str(delimiter.get("apply_stage", "post_topk_renorm_per_slot")),
         anti_steer_prior=str(warm_start.get("anti_steer_prior", "proxy_prefix_mass")),
         anti_steer_strength=max(0.0, float(warm_start.get("anti_steer_strength", 0.2))),
-        off_loss_type=str(off_loss_type_override or loss.get("off", {}).get("type", loss.get("off_type", "cvar"))),
+        off_loss_type=str(off_loss_type_override or off_loss_cfg.get("type", loss.get("off_type", "cvar"))),
         cvar_tail_fraction=cvar_tail_fraction,
-        off_train_source=str(loss.get("off", {}).get("train_source", "hard_pool")),
-        off_constraint_source=str(loss.get("off", {}).get("constraint_source", "fixed_stress_eval")),
-        off_hard_pool_size=max(1, int(loss.get("off", {}).get("hard_pool_size", 64))),
+        off_train_source=off_train_source,
+        off_constraint_source=off_constraint_source,
+        policy_mode=policy_mode,
+        policy_mode_effective=policy_mode_effective,
+        ci_forced_prod=ci_forced_prod,
+        debug_allow_nonfixed_constraint_sources=debug_allow_nonfixed_constraint_sources,
+        off_hard_pool_size=max(1, int(off_loss_cfg.get("hard_pool_size", 64))),
         train_steps=max(1, int(train.get("steps", 80))),
         train_lr=float(train.get("lr", 5e-2)),
         train_grad_clip=float(train.get("grad_clip", 1.0)),
+        constraint_warn_enabled=constraint_warn_enabled,
+        constraint_warn_patience_eval_ticks=constraint_warn_patience_eval_ticks,
+        constraint_warn_margin=constraint_warn_margin,
+        constraint_eval_every=constraint_eval_every,
         topk_schedule=topk_schedule,
         topk_milestones=topk_milestones,
         lambda_on=float(loss.get("lambda_on", 1.0)),
@@ -234,7 +295,7 @@ def resolve_phase3_settings(
             if lambda_off_adaptive_override is not None
             else train.get("lambda_off", {}).get("adaptive", True)
         ),
-        dual_metric_source=str(dual.get("metric_source", "fixed_stress_eval")),
+        dual_metric_source=dual_metric_source,
         dual_eta=float(dual.get("lr", 0.05)),
         dual_ema_beta=float(dual.get("ema_beta", 0.9)),
         dual_update_every=max(1, int(dual.get("update_every", 5))),
@@ -320,6 +381,7 @@ def run_phase3(
         "phase3_lambda_off_trace": [],
         "phase3_topk_schedule_trace": [],
         "phase3_loss_curve": [],
+        "phase3_constraint_warn_trace": [],
         "phase3_atom_type_mass": [],
     }
 
@@ -339,6 +401,7 @@ def run_phase3(
     artifacts["phase3_lambda_off_trace"] = train_result["lambda_trace"]
     artifacts["phase3_topk_schedule_trace"] = train_result["topk_trace"]
     artifacts["phase3_loss_curve"] = train_result["loss_curve"]
+    artifacts["phase3_constraint_warn_trace"] = train_result["constraint_warn_trace"]
 
     state_pool = _build_phase3_state_pool(
         runtime=runtime,
@@ -384,6 +447,14 @@ def run_phase3(
     loss_str = _structural_loss(state_pool=state_pool, settings=settings)
 
     lambda_trace = artifacts["phase3_lambda_off_trace"]
+    constraint_warn_summary = dict(train_result.get("constraint_warn_summary", {}))
+    constraint_warn_limit = float(settings.off_delta_p99_max + settings.constraint_warn_margin)
+    constraint_warn_summary["final_eval_metric_name"] = "off_delta_p99_stress"
+    constraint_warn_summary["final_eval_metric_source"] = "fixed_stress_eval"
+    constraint_warn_summary["final_eval_metric_value"] = float(off_fixed_eval["off_delta_p99_stress"])
+    constraint_warn_summary["final_eval_limit"] = float(constraint_warn_limit)
+    constraint_warn_summary["final_eval_violated"] = bool(off_fixed_eval["off_delta_p99_stress"] > constraint_warn_limit)
+    constraint_warn_summary["final_eval_typical_p99"] = float(off_fixed_eval["off_delta_p99_typical"])
 
     gateb = _build_gateb_result(
         settings=settings,
@@ -422,6 +493,14 @@ def run_phase3(
         ("phase3_loss_off_fixed_stress_eval", fixed_stress_loss_off),
         ("phase3_loss_str", loss_str),
         ("phase3_lambda_off_last", float(lambda_trace[-1]["lambda_off"]) if lambda_trace else settings.lambda_off),
+        ("phase3_constraint_source_is_fixed", 1.0 if settings.off_constraint_source == "fixed_stress_eval" else 0.0),
+        ("phase3_dual_metric_source_is_fixed", 1.0 if settings.dual_metric_source == "fixed_stress_eval" else 0.0),
+        ("phase3_constraint_warn_trigger_count", float(constraint_warn_summary.get("trigger_count", 0.0))),
+        (
+            "phase3_constraint_warn_max_consecutive_eval_ticks",
+            float(constraint_warn_summary.get("max_consecutive_eval_violations", 0.0)),
+        ),
+        ("phase3_constraint_warn_final_eval_violation", 1.0 if constraint_warn_summary["final_eval_violated"] else 0.0),
         ("phase3_gateA_pass", 1.0 if gatea["pass"] else 0.0),
         ("phase3_gateB_pass", 1.0 if gateb["pass"] else 0.0),
         ("phase3_milestone_pass", 1.0 if milestone["milestone_pass"] else 0.0),
@@ -435,6 +514,10 @@ def run_phase3(
         "device": settings.device,
         "model_id": settings.model_id,
         "decoding": settings.decoding,
+        "policy_mode": settings.policy_mode,
+        "policy_mode_effective": settings.policy_mode_effective,
+        "ci_forced_prod": settings.ci_forced_prod,
+        "debug_allow_nonfixed_constraint_sources": settings.debug_allow_nonfixed_constraint_sources,
         "mixture_scope": settings.layer_scope_mixture,
         "injection_scope": settings.layer_scope_injection,
         "mix_mode": settings.mix_mode,
@@ -445,6 +528,9 @@ def run_phase3(
             "cvar_tail_fraction": settings.cvar_tail_fraction,
             "train_source": settings.off_train_source,
             "constraint_source": settings.off_constraint_source,
+            "constraint_source_policy": "fixed_stress_eval_only_in_prod",
+            "train_source_policy_note": "hard_pool allowed for train_source in prod/debug",
+            "debug_override_enabled": settings.debug_allow_nonfixed_constraint_sources,
             "hard_pool_size": settings.off_hard_pool_size,
         },
         "fixed_stress_eval": artifacts["phase3_fixed_stress_eval_spec"],
@@ -458,6 +544,7 @@ def run_phase3(
             "delta_clip": settings.dual_delta_clip,
             "trace_len": len(lambda_trace),
         },
+        "warnings": {"constraint_warn_summary": constraint_warn_summary},
         "gates": {"A": gatea, "B": gateb},
         "milestone": milestone,
         "sample_counts": {
@@ -527,6 +614,33 @@ def select_report_off_loss(train_source: str, hard_pool_loss: float, fixed_stres
     if train_source == "fixed_stress_eval":
         return float(fixed_stress_loss)
     raise ValueError(f"Unsupported off_train_source: {train_source}")
+
+
+def should_eval_constraint_tick(step: int, eval_every: int) -> bool:
+    if eval_every <= 0:
+        raise ValueError("eval_every must be > 0")
+    return int(step) % int(eval_every) == 0
+
+
+def update_constraint_warn_state(
+    metric_value: float,
+    threshold: float,
+    margin: float,
+    patience_eval_ticks: int,
+    consecutive_violations: int,
+) -> dict[str, Any]:
+    if patience_eval_ticks <= 0:
+        raise ValueError("patience_eval_ticks must be > 0")
+    limit = float(threshold) + float(margin)
+    violated = float(metric_value) > limit
+    consecutive_next = int(consecutive_violations) + 1 if violated else 0
+    triggered = bool(violated and consecutive_next >= int(patience_eval_ticks))
+    return {
+        "limit": limit,
+        "violated": violated,
+        "consecutive_violations": consecutive_next,
+        "triggered": triggered,
+    }
 
 
 def _off_prompt_factors_tensor(
@@ -798,6 +912,11 @@ def _optimize_episode_states(
     loss_curve: list[dict[str, float]] = []
     lambda_trace: list[dict[str, float]] = []
     topk_trace: list[dict[str, float]] = []
+    constraint_warn_trace: list[dict[str, Any]] = []
+    constraint_warn_eval_ticks = 0
+    constraint_warn_consecutive = 0
+    constraint_warn_max_consecutive = 0
+    constraint_warn_trigger_count = 0
     train_inputs = off_samples_train or [{"sample_id": "off_train_default_0", "query_text": "default off train"}]
     fixed_inputs = off_samples_fixed or train_inputs
     train_factors = _off_prompt_factors_tensor(
@@ -929,6 +1048,35 @@ def _optimize_episode_states(
             fixed_p99=fixed_p99,
             hard_pool_p99=hard_pool_p99,
         )
+        constraint_warn_record: dict[str, Any] | None = None
+        if settings.constraint_warn_enabled and should_eval_constraint_tick(step=step, eval_every=settings.constraint_eval_every):
+            constraint_warn_eval_ticks += 1
+            warn_update = update_constraint_warn_state(
+                metric_value=float(fixed_p99),
+                threshold=float(settings.off_delta_p99_max),
+                margin=float(settings.constraint_warn_margin),
+                patience_eval_ticks=int(settings.constraint_warn_patience_eval_ticks),
+                consecutive_violations=int(constraint_warn_consecutive),
+            )
+            constraint_warn_consecutive = int(warn_update["consecutive_violations"])
+            constraint_warn_max_consecutive = max(constraint_warn_max_consecutive, constraint_warn_consecutive)
+            if bool(warn_update["triggered"]):
+                constraint_warn_trigger_count += 1
+            constraint_warn_record = {
+                "step": float(step),
+                "eval_tick": float(constraint_warn_eval_ticks - 1),
+                "metric_name": "off_delta_p99_stress_proxy",
+                "metric_source": "fixed_stress_eval",
+                "metric_value": float(fixed_p99),
+                "threshold": float(settings.off_delta_p99_max),
+                "margin": float(settings.constraint_warn_margin),
+                "limit": float(warn_update["limit"]),
+                "violated": bool(warn_update["violated"]),
+                "consecutive_violations": float(constraint_warn_consecutive),
+                "triggered": bool(warn_update["triggered"]),
+            }
+            constraint_warn_trace.append(constraint_warn_record)
+
         if p99_ema is None:
             p99_ema = p99_raw
         else:
@@ -966,14 +1114,31 @@ def _optimize_episode_states(
                 "off_train_source": settings.off_train_source,
                 "off_constraint_source": settings.off_constraint_source,
                 "dual_metric_source": settings.dual_metric_source,
+                "constraint_warn_eval_tick": float(1.0 if constraint_warn_record is not None else 0.0),
+                "constraint_warn_triggered": float(1.0 if constraint_warn_record and constraint_warn_record["triggered"] else 0.0),
+                "constraint_warn_consecutive": float(constraint_warn_consecutive),
                 "lambda_off": float(lambda_off_current),
             }
         )
 
+    last_warn_metric = float(constraint_warn_trace[-1]["metric_value"]) if constraint_warn_trace else 0.0
     return {
         "lambda_trace": lambda_trace,
         "topk_trace": topk_trace,
         "loss_curve": loss_curve,
+        "constraint_warn_trace": constraint_warn_trace,
+        "constraint_warn_summary": {
+            "enabled": bool(settings.constraint_warn_enabled),
+            "metric_name": "off_delta_p99_stress_proxy",
+            "metric_source": "fixed_stress_eval",
+            "eval_every": float(settings.constraint_eval_every),
+            "patience_eval_ticks": float(settings.constraint_warn_patience_eval_ticks),
+            "margin": float(settings.constraint_warn_margin),
+            "eval_ticks": float(constraint_warn_eval_ticks),
+            "trigger_count": float(constraint_warn_trigger_count),
+            "max_consecutive_eval_violations": float(constraint_warn_max_consecutive),
+            "last_metric_value": last_warn_metric,
+        },
     }
 
 
